@@ -1,5 +1,6 @@
-//! Application list: games, apps, background services and system
-//! processes, each expandable into its process tree.
+//! Application list: one list of apps (games included), with background
+//! services and system processes added on demand, each expandable into its
+//! process tree.
 
 use super::theme::*;
 use super::widgets::*;
@@ -11,11 +12,11 @@ use std::time::{Duration, Instant};
 
 const ROW_H: f32 = 30.0;
 const CONFIRM_FOR: Duration = Duration::from_secs(3);
-const SECTIONS: [(AppKind, &str); 4] = [
-    (AppKind::Game, "Games"),
-    (AppKind::App, "Applications"),
-    (AppKind::Background, "Background"),
-    (AppKind::System, "System"),
+/// The toggles above the list: what each includes.
+const TOGGLES: [(&str, &[AppKind]); 3] = [
+    ("Applications", &[AppKind::Game, AppKind::App]),
+    ("Background", &[AppKind::Background]),
+    ("System", &[AppKind::System]),
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -28,7 +29,8 @@ enum Col {
 
 pub struct AppsState {
     expanded: HashSet<String>,
-    closed_sections: HashSet<u8>,
+    /// Which of [`TOGGLES`] are on.
+    shown: [bool; 3],
     filter: String,
     /// Column and whether it's reversed from its natural direction (largest
     /// first, or A to Z for names). None leaves rows where they are.
@@ -45,7 +47,7 @@ impl Default for AppsState {
     fn default() -> Self {
         Self {
             expanded: HashSet::new(),
-            closed_sections: [section_id(AppKind::Background), section_id(AppKind::System)].into(),
+            shown: [true, false, false],
             filter: String::new(),
             sort: Some((Col::Cpu, false)),
             order: HashMap::new(),
@@ -55,12 +57,11 @@ impl Default for AppsState {
     }
 }
 
-fn section_id(k: AppKind) -> u8 {
-    k as u8
+fn shown(state: &AppsState, kind: AppKind) -> bool {
+    TOGGLES.iter().zip(state.shown).any(|((_, kinds), on)| on && kinds.contains(&kind))
 }
 
 enum Row<'a> {
-    Section { kind: AppKind, title: &'static str, groups: Vec<&'a AppGroup> },
     App(&'a AppGroup),
     Proc(&'a AppGroup, &'a ProcInfo),
 }
@@ -103,6 +104,14 @@ pub fn show(ui: &mut Ui, apps: &[AppGroup], total_mem: u64, height: f32, state: 
         if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
             state.filter.clear();
         }
+        ui.add_space(8.0);
+        // Right to left: the last toggle first.
+        for (i, (label, kinds)) in TOGGLES.iter().enumerate().rev() {
+            let count = apps.iter().filter(|g| kinds.contains(&g.kind)).count();
+            if toggle_chip(ui, label, count, state.shown[i]).clicked() {
+                state.shown[i] = !state.shown[i];
+            }
+        }
     });
     let width = ui.available_width();
     card(ui, width, |ui| {
@@ -119,7 +128,6 @@ pub fn show(ui: &mut Ui, apps: &[AppGroup], total_mem: u64, height: f32, state: 
             ui.spacing_mut().item_spacing.y = 0.0;
             for row in &rows[range] {
                 match row {
-                    Row::Section { kind, title, groups } => section_row(ui, *kind, title, groups, state),
                     Row::App(g) => app_row(ui, g, total_mem, state, send),
                     Row::Proc(g, p) => proc_row(ui, g, p, total_mem, state, send),
                 }
@@ -229,25 +237,16 @@ fn build_rows<'a>(apps: &'a [AppGroup], state: &mut AppsState, freeze: bool) -> 
         state.proc_order.clear();
     }
     let mut rows = Vec::new();
-    for (kind, title) in SECTIONS {
-        let in_section: Vec<_> = groups.iter().filter(|(g, _)| g.kind == kind).collect();
-        if in_section.is_empty() {
-            continue;
-        }
-        rows.push(Row::Section { kind, title, groups: in_section.iter().map(|(g, _)| *g).collect() });
-        let open = !state.closed_sections.contains(&section_id(kind)) || !filter.is_empty();
-        if !open {
-            continue;
-        }
-        for (g, auto_expand) in in_section {
-            rows.push(Row::App(g));
-            if (state.expanded.contains(&g.key) || *auto_expand) && g.procs.len() > 1 {
-                let procs = ordered_procs(g, state.sort, freeze_procs.then_some(&state.proc_order));
-                if !freeze_procs {
-                    state.proc_order.extend(procs.iter().enumerate().map(|(i, p)| ((g.key.clone(), p.pid), i)));
-                }
-                rows.extend(procs.into_iter().map(|p| Row::Proc(g, p)));
+    // A filter looks through everything: typing means looking for something.
+    groups.retain(|(g, _)| !filter.is_empty() || shown(state, g.kind));
+    for (g, auto_expand) in &groups {
+        rows.push(Row::App(g));
+        if (state.expanded.contains(&g.key) || *auto_expand) && g.procs.len() > 1 {
+            let procs = ordered_procs(g, state.sort, freeze_procs.then_some(&state.proc_order));
+            if !freeze_procs {
+                state.proc_order.extend(procs.iter().enumerate().map(|(i, p)| ((g.key.clone(), p.pid), i)));
             }
+            rows.extend(procs.into_iter().map(|p| Row::Proc(g, p)));
         }
     }
     rows
@@ -366,32 +365,25 @@ fn io_text(v: f64) -> String {
     }
 }
 
-fn section_row(ui: &mut Ui, kind: AppKind, title: &str, groups: &[&AppGroup], state: &mut AppsState) {
-    let w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(vec2(w, ROW_H), Sense::click());
-    let id = section_id(kind);
-    let open = !state.closed_sections.contains(&id) || !state.filter.trim().is_empty();
-    if resp.clicked() && !state.closed_sections.remove(&id) {
-        state.closed_sections.insert(id);
-    }
+/// A toggle in the section header: on is filled, off is outlined.
+fn toggle_chip(ui: &mut Ui, label: &str, count: usize, on: bool) -> egui::Response {
+    let lg = ui.fonts_mut(|f| f.layout_no_wrap(label.to_string(), font(12.0), TEXT));
+    let cg = ui.fonts_mut(|f| f.layout_no_wrap(count.to_string(), font(11.5), FAINT));
+    let size = vec2(10.0 + lg.size().x + 6.0 + cg.size().x + 10.0, 24.0);
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     let p = ui.painter();
-    if resp.hovered() {
-        p.rect_filled(rect.shrink2(vec2(0.0, 2.0)), CornerRadius::same(6), SURFACE_HOVER);
-    }
-    chevron(p, pos2(rect.left() + 14.0, rect.center().y), open, MUTED);
-    let galley = ui.fonts_mut(|f| f.layout_job(eyebrow(title, TEXT_2)));
-    let tw = galley.size().x;
-    p.galley(pos2(rect.left() + 28.0, rect.center().y - galley.size().y / 2.0), galley, TEXT_2);
-    p.text(pos2(rect.left() + 36.0 + tw, rect.center().y), Align2::LEFT_CENTER, groups.len().to_string(), font(11.5), FAINT);
-
-    let c = columns(rect);
-    let cpu: f32 = groups.iter().map(|g| g.cpu).sum();
-    let mem: u64 = groups.iter().map(|g| g.mem).sum();
-    let io: f64 = groups.iter().map(|g| g.io).sum();
-    p.text(pos2(c.cpu.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, cpu_text(cpu), font(11.5), MUTED);
-    p.text(pos2(c.mem.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, bytes(mem as f64), font(11.5), MUTED);
-    p.text(pos2(c.disk.right() - 8.0, rect.center().y), Align2::RIGHT_CENTER, io_text(io), font(11.5), MUTED);
-    resp.on_hover_cursor(CursorIcon::PointingHand);
+    let (fill, stroke, text) = match (on, resp.hovered()) {
+        (true, _) => (RAISED, BORDER, TEXT),
+        (false, true) => (SURFACE_HOVER, BORDER, TEXT_2),
+        (false, false) => (Color32::TRANSPARENT, BORDER, MUTED),
+    };
+    p.rect(rect, CornerRadius::same(12), fill, Stroke::new(1.0, stroke), egui::StrokeKind::Inside);
+    let y = rect.center().y;
+    let lw = lg.size().x;
+    p.galley(pos2(rect.left() + 10.0, y - lg.size().y / 2.0), lg, text);
+    p.galley(pos2(rect.left() + 16.0 + lw, y - cg.size().y / 2.0), cg, FAINT);
+    let tip = if on { format!("Hide {}", label.to_lowercase()) } else { format!("Show {}", label.to_lowercase()) };
+    resp.on_hover_cursor(CursorIcon::PointingHand).on_hover_text(tip)
 }
 
 /// The End button: first click arms it, second click within a few seconds
@@ -472,8 +464,20 @@ fn app_row(ui: &mut Ui, g: &AppGroup, total_mem: u64, state: &mut AppsState, sen
         });
         let nw = name.size().x;
         p.with_clip_rect(c.name).galley(pos2(name_x, rect.center().y - name.size().y / 2.0), name, TEXT);
+        let mut after = name_x + nw + 8.0;
         if expandable {
-            p.text(pos2(name_x + nw + 8.0, rect.center().y), Align2::LEFT_CENTER, g.procs.len().to_string(), font(11.5), FAINT);
+            let r = p.text(pos2(after, rect.center().y), Align2::LEFT_CENTER, g.procs.len().to_string(), font(11.5), FAINT);
+            after = r.right() + 8.0;
+        }
+        // Everything shares one list, so say what isn't a plain app.
+        let tag = match g.kind {
+            AppKind::Game => Some("game"),
+            AppKind::Background => Some("background"),
+            AppKind::System => Some("system"),
+            AppKind::App => None,
+        };
+        if let Some(t) = tag {
+            p.with_clip_rect(c.name).text(pos2(after, rect.center().y), Align2::LEFT_CENTER, t, font(11.0), MUTED);
         }
         bar_cell(p, c.cpu, &cpu_text(g.cpu), g.cpu / 100.0, LOAD, TEXT_2);
         let mf = if total_mem > 0 { g.mem as f32 / total_mem as f32 } else { 0.0 };
