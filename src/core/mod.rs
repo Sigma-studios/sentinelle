@@ -107,6 +107,24 @@ pub struct DiskStats {
     pub scanning: Option<u64>,
     /// Seconds since the segments were computed.
     pub scanned_ago: Option<u64>,
+    /// Where the segments come from.
+    pub source: DiskSource,
+}
+
+/// Who measures a disk: sentinelle's own periodic scan, or the répertoire
+/// daemon, which keeps its numbers current from kernel events.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum DiskSource {
+    #[default]
+    Scan,
+    /// répertoire's first scan of this disk; nothing to show yet.
+    Indexing { progress: f32 },
+    /// répertoire serves saved numbers while it checks them (after a start).
+    Reconciling { progress: f32 },
+    /// Current: répertoire applies every change as it happens.
+    Live,
+    /// répertoire missed changes and is rescanning; numbers may be off.
+    Stale { progress: f32 },
 }
 
 #[derive(Clone, Debug, PartialEq)]

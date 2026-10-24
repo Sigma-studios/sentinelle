@@ -86,6 +86,7 @@ fn dump_samples(config: core::Config) {
     }
     for d in &s.disks {
         println!("disk     {} {:?} {} {}/{} GiB", d.device, d.mount_points, d.fs_type, d.used >> 30, d.total >> 30);
+        print_segments(d);
     }
     println!(
         "net      {} {:?} {:?} {:?} ping {:?} via {}",
@@ -96,7 +97,34 @@ fn dump_samples(config: core::Config) {
         s.net.ping.last(),
         s.net.ping_method
     );
+    // SENTINELLE_DUMP_FOR=<secs>: keep watching storage, printing it again
+    // whenever it changes (handy to see répertoire's live updates).
+    let watch: u64 = std::env::var("SENTINELLE_DUMP_FOR").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let until = std::time::Instant::now() + Duration::from_secs(watch);
+    let mut last = disks_line(&s.disks);
+    while std::time::Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(500));
+        let now = monitor.snapshot();
+        if disks_line(&now.disks) != last {
+            last = disks_line(&now.disks);
+            for d in &now.disks {
+                println!("disk     {:?}", d.mount_points);
+                print_segments(d);
+            }
+        }
+    }
     for a in &s.apps {
         println!("app      {:<10} {:<32} {:>5.1}% {:>6} MiB  {} procs", format!("{:?}", a.kind), a.name, a.cpu, a.mem >> 20, a.procs.len());
     }
+}
+
+fn print_segments(d: &core::DiskStats) {
+    println!("           source {:?}, scanning {:?}, scanned {:?} s ago", d.source, d.scanning, d.scanned_ago);
+    for seg in &d.segments {
+        println!("           {:>8} MiB  {:?} {}", seg.size >> 20, seg.kind, seg.path.display());
+    }
+}
+
+fn disks_line(disks: &[core::DiskStats]) -> String {
+    disks.iter().map(|d| format!("{:?}{:?}", d.source, d.segments.iter().map(|s| (s.size, &s.path)).collect::<Vec<_>>())).collect()
 }

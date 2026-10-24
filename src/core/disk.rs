@@ -1,17 +1,21 @@
-//! Mounted filesystems and a background scan of where their space goes.
+//! Mounted filesystems and where their space goes.
 //!
-//! The scan builds a pruned size tree (only directories big enough to ever
-//! matter are kept) and then [`partition`] picks a handful of paths so each
-//! one is roughly between 10% and 50% of the used space.
+//! Two sources fill the same [`DiskState`]: the répertoire daemon when it
+//! answers on its socket (live numbers, kept current by the kernel), and
+//! otherwise our own background scan. The scan builds a pruned size tree
+//! (only directories big enough to ever matter are kept); either way
+//! [`partition`] then picks a handful of paths so each one is roughly
+//! between 10% and 50% of the used space.
 
 use super::util::{deprioritize_current_thread, home_dir, read_string};
-use super::{DiskSegment, SegmentKind};
+use super::{DiskSegment, DiskSource, SegmentKind};
+use repertoire_proto as rp;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 const REAL_FS: &[&str] = &[
     "ext2", "ext3", "ext4", "btrfs", "xfs", "f2fs", "zfs", "bcachefs", "jfs", "reiserfs", "ntfs", "ntfs3", "fuseblk",
@@ -277,6 +281,11 @@ pub struct DiskState {
     pub results: HashMap<String, ScanResult>,
     /// Filesystem id currently being scanned and its progress.
     pub scanning: Option<(String, Arc<AtomicU64>)>,
+    /// Set while répertoire serves the numbers; our scanner then rests.
+    pub daemon: bool,
+    /// Per filesystem id: répertoire's state, and bytes seen during its
+    /// first scan.
+    pub live: HashMap<String, (DiskSource, Option<u64>)>,
 }
 
 pub type SharedDisks = Arc<Mutex<DiskState>>;
@@ -304,6 +313,9 @@ pub fn spawn_scanner(state: SharedDisks) -> std::sync::mpsc::Sender<()> {
             loop {
                 let (filesystems, mounts) = filesystems();
                 for fs in &filesystems {
+                    if state.lock().unwrap().daemon {
+                        continue; // répertoire has it
+                    }
                     let fresh = state
                         .lock()
                         .unwrap()
@@ -335,6 +347,129 @@ pub fn spawn_scanner(state: SharedDisks) -> std::sync::mpsc::Sender<()> {
         })
         .expect("spawn disk scanner");
     tx
+}
+
+// ---------------------------------------------------------------- répertoire
+
+/// How often to look for the daemon when it isn't there.
+const RETRY_EVERY: Duration = Duration::from_secs(60);
+/// Refresh even without change events, in case one was missed.
+const BACKSTOP: Duration = Duration::from_secs(30);
+
+/// Use répertoire whenever its socket answers; look again every minute, so
+/// starting the daemon later switches over without restarting sentinelle.
+/// Without it, nothing here does anything and the scanner works as always.
+pub fn spawn_live(state: SharedDisks) {
+    std::thread::Builder::new()
+        .name("disk-live".into())
+        .spawn(move || loop {
+            let _ = run_live(&state);
+            {
+                let mut st = state.lock().unwrap();
+                st.daemon = false;
+                st.live.clear();
+            }
+            std::thread::sleep(RETRY_EVERY);
+        })
+        .expect("spawn disk-live");
+}
+
+fn run_live(state: &SharedDisks) -> Result<(), rp::Error> {
+    let mut client = rp::Client::connect()?;
+    client.hello("sentinelle")?;
+    let mounts: Vec<PathBuf> = filesystems().0.iter().flat_map(|f| f.mount_points.clone()).collect();
+    let refs: Vec<&Path> = mounts.iter().map(|m| m.as_path()).collect();
+    let mut events = rp::Client::connect()?.subscribe(&refs)?;
+    state.lock().unwrap().daemon = true;
+    let mut last = Instant::now() - BACKSTOP;
+    let mut dirty = true;
+    loop {
+        // Changes arrive at most once a second per folder; refresh at most
+        // once a second too, and every 30 s regardless.
+        let wait = if dirty { Duration::from_secs(1).saturating_sub(last.elapsed()) } else { BACKSTOP.saturating_sub(last.elapsed()) };
+        events.set_timeout(Some(wait.max(Duration::from_millis(50))))?;
+        match events.next() {
+            None => return Ok(()), // the daemon went away
+            Some(Ok(_)) => dirty = true,
+            Some(Err(rp::Error::Io(e))) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+            Some(Err(e)) => return Err(e),
+        }
+        if (dirty && last.elapsed() >= Duration::from_secs(1)) || last.elapsed() >= BACKSTOP {
+            refresh_live(&mut client, state)?;
+            last = Instant::now();
+            dirty = false;
+        }
+    }
+}
+
+fn refresh_live(client: &mut rp::Client, state: &SharedDisks) -> Result<(), rp::Error> {
+    let infos = client.filesystems()?;
+    let mut updates = Vec::new();
+    for fs in filesystems().0 {
+        let Some(info) = infos.iter().find(|i| i.mount_points.iter().any(|m| m.path.to_path() == fs.mount_points[0])) else {
+            continue;
+        };
+        let has_data = !matches!(info.state, rp::FsState::Scanning { .. });
+        let mut trees = Vec::new();
+        if has_data {
+            for mp in &fs.mount_points {
+                trees.push(client.tree(mp, info.used / 200, 64)?); // 0.5%, as our scanner keeps
+            }
+        }
+        updates.push((fs.id, live_result(info, &trees)));
+    }
+    let mut st = state.lock().unwrap();
+    for (id, (result, source, seen)) in updates {
+        if let Some(r) = result {
+            st.results.insert(id.clone(), r);
+        }
+        st.live.insert(id, (source, seen));
+    }
+    // Keep the cache warm in case the daemon stops and sentinelle restarts.
+    save_cache(&st.results);
+    Ok(())
+}
+
+/// Turn répertoire's answers for one filesystem into what the scanner would
+/// have produced: segments (when there is data), the source to show, and
+/// bytes seen while its first scan runs.
+pub fn live_result(info: &rp::FsInfo, trees: &[rp::TreeNode]) -> (Option<ScanResult>, DiskSource, Option<u64>) {
+    let (source, seen) = match info.state {
+        rp::FsState::Scanning { progress, bytes_seen } => (DiskSource::Indexing { progress }, Some(bytes_seen)),
+        rp::FsState::Reconciling { progress, .. } => (DiskSource::Reconciling { progress }, None),
+        rp::FsState::Stale { progress, .. } => (DiskSource::Stale { progress }, None),
+        rp::FsState::Live => (DiskSource::Live, None),
+        // Indexed but not watched: as good as one of our scans.
+        rp::FsState::Static => (DiskSource::Scan, None),
+    };
+    if trees.is_empty() {
+        return (None, source, seen);
+    }
+    let mut root = Node::default();
+    for t in trees {
+        let n = to_node(t);
+        root.size += n.size;
+        root.children.push(n);
+    }
+    let at = match (source, info.last_full_scan) {
+        (DiskSource::Scan, Some(t)) => SystemTime::UNIX_EPOCH + Duration::from_secs(t.max(0) as u64),
+        _ => SystemTime::now(),
+    };
+    (Some(ScanResult { segments: partition(&root, root.size), at }), source, seen)
+}
+
+fn to_node(t: &rp::TreeNode) -> Node {
+    Node { path: t.path.to_path(), size: t.size, own: t.own, children: t.children.iter().map(to_node).collect() }
+}
+
+/// The Rescan button: ask répertoire when it serves the numbers, otherwise
+/// wake our scanner.
+pub fn rescan(state: &SharedDisks, scanner: &std::sync::mpsc::Sender<()>) {
+    if state.lock().unwrap().daemon {
+        std::thread::spawn(|| rp::Client::connect().and_then(|mut c| c.rescan(None)));
+    } else {
+        let _ = scanner.send(());
+    }
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -423,6 +558,61 @@ mod tests {
             ]
         );
         assert!(segs.iter().all(|s| s.size <= 50));
+    }
+
+    fn info(state: rp::FsState) -> rp::FsInfo {
+        rp::FsInfo {
+            id: "/dev/nvme0n1p2".into(),
+            device: "nvme0n1p2".into(),
+            fs_type: "ext4".into(),
+            mount_points: vec![rp::MountPoint { path: "/".into() }],
+            total: 1000,
+            used: 100,
+            indexed: 100,
+            files: 10,
+            dirs: 3,
+            state,
+            last_full_scan: Some(1_700_000_000),
+        }
+    }
+
+    fn t(path: &str, own: u64, children: Vec<rp::TreeNode>) -> rp::TreeNode {
+        let size = own + children.iter().map(|c| c.size).sum::<u64>();
+        rp::TreeNode { path: path.into(), size, own, children }
+    }
+
+    #[test]
+    fn live_answers_map_to_the_same_segments_as_a_scan() {
+        let tree = t("/", 5, vec![t("/home", 2, vec![t("/home/u", 13, vec![t("/home/u/Games", 40, vec![]), t("/home/u/.cache", 15, vec![])])]), t("/usr", 25, vec![])]);
+        let (result, source, seen) = live_result(&info(rp::FsState::Live), &[tree]);
+        assert_eq!(source, DiskSource::Live);
+        assert_eq!(seen, None);
+        let segs: Vec<_> = result.unwrap().segments.iter().map(|s| (s.path.to_string_lossy().into_owned(), s.size)).collect();
+        // Same input as `splits_until_under_half`, same answer.
+        assert_eq!(segs, vec![("/home/u/Games".into(), 40), ("/usr".into(), 25), ("/home/u/.cache".into(), 15), ("/home/u".into(), 13), ("".into(), 7)]);
+    }
+
+    #[test]
+    fn live_states_map_onto_sources() {
+        let (r, s, seen) = live_result(&info(rp::FsState::Scanning { progress: 0.25, bytes_seen: 25 }), &[]);
+        assert!(r.is_none());
+        assert_eq!(s, DiskSource::Indexing { progress: 0.25 });
+        assert_eq!(seen, Some(25));
+        let leaf = || vec![t("/", 100, vec![])];
+        assert_eq!(live_result(&info(rp::FsState::Reconciling { progress: 0.5, bytes_seen: 50 }), &leaf()).1, DiskSource::Reconciling { progress: 0.5 });
+        assert_eq!(live_result(&info(rp::FsState::Stale { progress: 0.1, bytes_seen: 10 }), &leaf()).1, DiskSource::Stale { progress: 0.1 });
+        // Not watched: shown like one of our scans, aged from its scan time.
+        let (r, s, _) = live_result(&info(rp::FsState::Static), &leaf());
+        assert_eq!(s, DiskSource::Scan);
+        assert_eq!(r.unwrap().at, SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
+    }
+
+    #[test]
+    fn several_mount_points_sit_under_one_root() {
+        let (r, _, _) = live_result(&info(rp::FsState::Live), &[t("/", 30, vec![]), t("/home", 70, vec![])]);
+        let segs = r.unwrap().segments;
+        assert_eq!(segs.iter().map(|s| s.size).sum::<u64>(), 100);
+        assert_eq!(segs[0].path, PathBuf::from("/home"));
     }
 
     #[test]
