@@ -36,6 +36,8 @@ pub struct AppsState {
     /// Order shown last frame; reused while the pointer is over the list so
     /// rows don't jump away from the cursor, and kept as is when unsorted.
     order: HashMap<String, usize>,
+    /// The same for the processes of expanded groups, by (group, pid).
+    proc_order: HashMap<(String, u32), usize>,
     confirm: Option<(String, Instant)>,
 }
 
@@ -47,6 +49,7 @@ impl Default for AppsState {
             filter: String::new(),
             sort: Some((Col::Cpu, false)),
             order: HashMap::new(),
+            proc_order: HashMap::new(),
             confirm: None,
         }
     }
@@ -195,23 +198,8 @@ fn build_rows<'a>(apps: &'a [AppGroup], state: &mut AppsState, freeze: bool) -> 
 
     match state.sort {
         Some((col, reversed)) if !(freeze && !state.order.is_empty()) => {
-            let key = |g: &AppGroup| -> f64 {
-                match col {
-                    Col::Name => 0.0,
-                    Col::Cpu => -(g.cpu as f64),
-                    Col::Memory => -(g.mem as f64),
-                    Col::Disk => -g.io,
-                }
-            };
             groups.sort_by(|(a, _), (b, _)| {
-                let by_value = key(a).partial_cmp(&key(b)).unwrap_or(Ordering::Equal);
-                let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
-                // Equal values stay A to Z, unless names are the sort itself.
-                match (reversed, col) {
-                    (false, _) => by_value.then(by_name),
-                    (true, Col::Name) => by_name.reverse(),
-                    (true, _) => by_value.reverse().then(by_name),
-                }
+                compare(col, reversed, (a.cpu, a.mem, a.io, &a.name), (b.cpu, b.mem, b.io, &b.name))
             });
             state.order = groups.iter().enumerate().map(|(i, (g, _))| (g.key.clone(), i)).collect();
         }
@@ -236,6 +224,10 @@ fn build_rows<'a>(apps: &'a [AppGroup], state: &mut AppsState, freeze: bool) -> 
         }
     }
 
+    let freeze_procs = freeze && !state.proc_order.is_empty();
+    if !freeze_procs {
+        state.proc_order.clear();
+    }
     let mut rows = Vec::new();
     for (kind, title) in SECTIONS {
         let in_section: Vec<_> = groups.iter().filter(|(g, _)| g.kind == kind).collect();
@@ -250,11 +242,81 @@ fn build_rows<'a>(apps: &'a [AppGroup], state: &mut AppsState, freeze: bool) -> 
         for (g, auto_expand) in in_section {
             rows.push(Row::App(g));
             if (state.expanded.contains(&g.key) || *auto_expand) && g.procs.len() > 1 {
-                rows.extend(g.procs.iter().map(|p| Row::Proc(g, p)));
+                let procs = ordered_procs(g, state.sort, freeze_procs.then_some(&state.proc_order));
+                if !freeze_procs {
+                    state.proc_order.extend(procs.iter().enumerate().map(|(i, p)| ((g.key.clone(), p.pid), i)));
+                }
+                rows.extend(procs.into_iter().map(|p| Row::Proc(g, p)));
             }
         }
     }
     rows
+}
+
+/// Order by a column's value, largest first (or names A to Z), with
+/// `reversed` flipping it. Equal values stay A to Z, unless names are the
+/// sort itself.
+fn compare(col: Col, reversed: bool, a: (f32, u64, f64, &str), b: (f32, u64, f64, &str)) -> Ordering {
+    let key = |(cpu, mem, io, _): (f32, u64, f64, &str)| -> f64 {
+        match col {
+            Col::Name => 0.0,
+            Col::Cpu => -(cpu as f64),
+            Col::Memory => -(mem as f64),
+            Col::Disk => -io,
+        }
+    };
+    let by_value = key(a).partial_cmp(&key(b)).unwrap_or(Ordering::Equal);
+    let by_name = a.3.to_lowercase().cmp(&b.3.to_lowercase());
+    match (reversed, col) {
+        (false, _) => by_value.then(by_name),
+        (true, Col::Name) => by_name.reverse(),
+        (true, _) => by_value.reverse().then(by_name),
+    }
+}
+
+/// A group's processes in display order. The core hands them over as a tree
+/// flattened depth first (by start time, then pid); this keeps the tree but
+/// sorts each set of siblings by the chosen column, or by their place last
+/// frame when `frozen` (pointer over the list). Unsorted keeps the core's
+/// order, which is already stable.
+fn ordered_procs<'a>(g: &'a AppGroup, sort: Option<(Col, bool)>, frozen: Option<&HashMap<(String, u32), usize>>) -> Vec<&'a ProcInfo> {
+    if sort.is_none() && frozen.is_none() {
+        return g.procs.iter().collect();
+    }
+    // Rebuild the tree: a process's parent is the closest one before it
+    // that sits one level higher.
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); g.procs.len()];
+    let mut roots = Vec::new();
+    let mut path: Vec<usize> = Vec::new();
+    for (i, p) in g.procs.iter().enumerate() {
+        path.truncate(p.depth as usize);
+        match path.last() {
+            Some(&parent) => children[parent].push(i),
+            None => roots.push(i),
+        }
+        path.push(i);
+    }
+    let sort_siblings = |ids: &mut Vec<usize>| match (frozen, sort) {
+        (Some(last), _) => {
+            let at = |i: usize| last.get(&(g.key.clone(), g.procs[i].pid)).copied().unwrap_or(usize::MAX);
+            ids.sort_by_key(|&i| at(i));
+        }
+        (None, Some((col, reversed))) => ids.sort_by(|&a, &b| {
+            let (a, b) = (&g.procs[a], &g.procs[b]);
+            compare(col, reversed, (a.cpu, a.mem, a.io, &a.name), (b.cpu, b.mem, b.io, &b.name))
+        }),
+        (None, None) => {}
+    };
+    let mut out = Vec::with_capacity(g.procs.len());
+    sort_siblings(&mut roots);
+    let mut stack: Vec<usize> = roots.into_iter().rev().collect();
+    while let Some(i) = stack.pop() {
+        out.push(&g.procs[i]);
+        let mut kids = std::mem::take(&mut children[i]);
+        sort_siblings(&mut kids);
+        stack.extend(kids.into_iter().rev());
+    }
+    out
 }
 
 fn chevron(p: &egui::Painter, center: egui::Pos2, open: bool, color: Color32) {
@@ -463,4 +525,33 @@ fn proc_row(ui: &mut Ui, g: &AppGroup, pr: &ProcInfo, total_mem: u64, state: &mu
     }
     let resp = resp.on_hover_text_at_pointer(&*pr.cmdline);
     context_menu(&resp, &[pr.pid], Some(&pr.cmdline), send);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc(pid: u32, depth: u8, cpu: f32) -> ProcInfo {
+        ProcInfo { pid, name: format!("p{pid}"), cmdline: "".into(), depth, cpu, mem: 0, io: 0.0 }
+    }
+
+    #[test]
+    fn siblings_sort_within_the_tree() {
+        // 1 ─┬─ 2 ─── 3
+        //    └─ 4
+        // 5
+        let g = AppGroup {
+            key: "k".into(),
+            name: "app".into(),
+            kind: AppKind::App,
+            cpu: 0.0,
+            mem: 0,
+            io: 0.0,
+            procs: vec![proc(1, 0, 1.0), proc(2, 1, 1.0), proc(3, 2, 9.0), proc(4, 1, 5.0), proc(5, 0, 3.0)],
+        };
+        let pids = |sort| ordered_procs(&g, sort, None).iter().map(|p| p.pid).collect::<Vec<_>>();
+        assert_eq!(pids(None), [1, 2, 3, 4, 5]);
+        assert_eq!(pids(Some((Col::Cpu, false))), [5, 1, 4, 2, 3]);
+        assert_eq!(pids(Some((Col::Cpu, true))), [1, 2, 3, 4, 5]);
+    }
 }
