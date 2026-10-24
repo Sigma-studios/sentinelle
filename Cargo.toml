@@ -11,7 +11,7 @@ libc = "0.2"
 libloading = "0.8"
 rayon = "1.10"
 # Live storage numbers from the répertoire daemon (types + blocking client).
-repertoire-proto = { git = "https://github.com/Sigma-studios/repertoire", rev = "d932a8e18b742dfdfb525a87c8c071c774962e33" }
+repertoire-proto = { git = "https://github.com/Sigma-studios/repertoire", rev = "8b9ca268b5084341b3a85bd7342e7e322a91f8d6" }
 
 [profile.release]
 opt-level = 3
