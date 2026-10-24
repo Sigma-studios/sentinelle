@@ -2,7 +2,7 @@
 
 use super::theme::*;
 use super::widgets::*;
-use crate::core::{self, Command, DiskSegment, DiskStats, SegmentKind};
+use crate::core::{self, Command, DiskSegment, DiskSource, DiskStats, SegmentKind};
 use eframe::egui::{self, pos2, vec2, Align, Color32, CornerRadius, CursorIcon, Layout, Rect, RichText, Sense, Stroke, Ui};
 
 #[derive(Default)]
@@ -17,7 +17,9 @@ pub fn show(ui: &mut Ui, disks: &[DiskStats], state: &mut StorageState, send: &d
         if !scanning && ghost_button(ui, "Rescan").on_hover_text("Measure folder sizes again").clicked() {
             send(Command::RescanDisks);
         }
-        if let Some(age) = disks.iter().filter_map(|d| d.scanned_ago).max() {
+        if let Some((color, label, tip)) = live_state(disks) {
+            status_badge(ui, color, label).on_hover_text(tip);
+        } else if let Some(age) = disks.iter().filter_map(|d| d.scanned_ago).max() {
             ui.label(muted(format!("measured {} ago", duration(age))));
         }
     });
@@ -41,6 +43,33 @@ pub fn show(ui: &mut Ui, disks: &[DiskStats], state: &mut StorageState, send: &d
         }
         state.hovered = next_hover;
     });
+}
+
+/// When répertoire measures the disks: how current the numbers are, as a
+/// status dot with its label and an explanation.
+fn live_state(disks: &[DiskStats]) -> Option<(Color32, &'static str, &'static str)> {
+    let sources: Vec<DiskSource> = disks.iter().map(|d| d.source).filter(|s| *s != DiskSource::Scan).collect();
+    if sources.is_empty() {
+        return None;
+    }
+    Some(if sources.iter().any(|s| matches!(s, DiskSource::Stale { .. })) {
+        (WARNING, "catching up", "répertoire missed some changes and is measuring again; sizes may be off until it's done")
+    } else if sources.iter().any(|s| matches!(s, DiskSource::Reconciling { .. } | DiskSource::Indexing { .. })) {
+        (MUTED, "checking", "répertoire is checking its saved sizes against the disk; they update as it goes")
+    } else {
+        (GOOD, "live", "Sizes follow every change as it happens (répertoire)")
+    })
+}
+
+/// What a disk's own header says about where its numbers stand.
+fn source_note(d: &DiskStats) -> Option<String> {
+    let pct = |p: f32| (p * 100.0).round() as u32;
+    match d.source {
+        DiskSource::Indexing { progress } => Some(format!("indexing… {}% ·", pct(progress))),
+        DiskSource::Reconciling { progress } => Some(format!("checking saved sizes… {}% ·", pct(progress))),
+        DiskSource::Stale { progress } => Some(format!("missed changes, measuring again… {}% ·", pct(progress))),
+        DiskSource::Live | DiskSource::Scan => None,
+    }
 }
 
 fn segment_color(segments: &[DiskSegment], i: usize) -> Color32 {
@@ -96,7 +125,12 @@ fn disk(ui: &mut Ui, d: &DiskStats, highlighted: Option<usize>) -> Option<usize>
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(muted(format!("{} free", bytes(free as f64))));
             ui.label(secondary(format!("{} of {}", bytes(d.used as f64), bytes(d.total as f64))));
-            if let Some(seen) = d.scanning {
+            if let DiskSource::Stale { .. } = d.source {
+                ui.label(muted("·"));
+                status_badge(ui, WARNING, source_note(d).unwrap_or_default().trim_end_matches(" ·"));
+            } else if let Some(note) = source_note(d) {
+                ui.label(muted(note));
+            } else if let Some(seen) = d.scanning {
                 ui.label(muted(format!("measuring… {} so far ·", bytes(seen as f64))));
             }
         });

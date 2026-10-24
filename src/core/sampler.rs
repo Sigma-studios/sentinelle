@@ -80,6 +80,7 @@ fn run(config: Config, shared: Arc<Shared>, commands: Receiver<Command>) {
 
     let disks: SharedDisks = Arc::new(Mutex::new(DiskState::default()));
     let rescan = disk::spawn_scanner(disks.clone());
+    disk::spawn_live(disks.clone());
     let mut filesystems: Vec<Filesystem> = Vec::new();
 
     let mut next = Instant::now();
@@ -168,7 +169,7 @@ fn run(config: Config, shared: Arc<Shared>, commands: Receiver<Command>) {
         loop {
             let wait = next.saturating_duration_since(Instant::now());
             match commands.recv_timeout(wait) {
-                Ok(cmd) => handle(cmd, &shared, &ping, &rescan),
+                Ok(cmd) => handle(cmd, &shared, &ping, &disks, &rescan),
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
@@ -180,6 +181,7 @@ fn handle(
     cmd: Command,
     shared: &Shared,
     ping: &Mutex<PingState>,
+    disks: &SharedDisks,
     rescan: &std::sync::mpsc::Sender<()>,
 ) {
     match cmd {
@@ -195,9 +197,7 @@ fn handle(
                 shared.notice(format!("Not permitted to stop {what}"));
             }
         }
-        Command::RescanDisks => {
-            let _ = rescan.send(());
-        }
+        Command::RescanDisks => disk::rescan(disks, rescan),
         Command::SetPingHost(host) => {
             let mut p = ping.lock().unwrap();
             if p.host != host {
@@ -247,11 +247,13 @@ fn disk_stats(filesystems: &[Filesystem], disks: &SharedDisks) -> Vec<DiskStats>
                     segments.push(DiskSegment { path: PathBuf::new(), size: used - seen, kind: SegmentKind::Hidden });
                 }
             }
+            let (source, live_seen) = st.live.get(&fs.id).copied().unwrap_or_default();
             let scanning = st
                 .scanning
                 .as_ref()
                 .filter(|(id, _)| *id == fs.id)
-                .map(|(_, p)| p.load(Ordering::Relaxed));
+                .map(|(_, p)| p.load(Ordering::Relaxed))
+                .or(live_seen);
             Some(DiskStats {
                 id: fs.id.clone(),
                 mount_points: fs.mount_points.clone(),
@@ -262,6 +264,7 @@ fn disk_stats(filesystems: &[Filesystem], disks: &SharedDisks) -> Vec<DiskStats>
                 segments,
                 scanning,
                 scanned_ago: result.and_then(|r| SystemTime::now().duration_since(r.at).ok()).map(|d| d.as_secs()),
+                source,
             })
         })
         .collect()

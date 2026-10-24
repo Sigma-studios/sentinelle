@@ -10,6 +10,8 @@ eframe = { version = "0.36", default-features = false, features = ["glow", "wayl
 libc = "0.2"
 libloading = "0.8"
 rayon = "1.10"
+# Live storage numbers from the répertoire daemon (types + blocking client).
+repertoire-proto = { git = "https://github.com/Sigma-studios/repertoire", rev = "d932a8e18b742dfdfb525a87c8c071c774962e33" }
 
 [profile.release]
 opt-level = 3

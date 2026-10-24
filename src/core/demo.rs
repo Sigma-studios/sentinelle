@@ -1,4 +1,8 @@
 //! A plausible, fixed snapshot for UI work on machines without `/proc`.
+//!
+//! Disks look as répertoire serves them (one live, one reconciling after a
+//! restart, one stale after missed events). `SENTINELLE_DEMO=scan` shows
+//! them as sentinelle's own scanner does instead.
 
 use super::*;
 
@@ -92,38 +96,7 @@ pub fn snapshot() -> Snapshot {
                 clock_mhz: Some(800),
             },
         ],
-        disks: vec![
-            DiskStats {
-                id: "/dev/nvme0n1p2".into(),
-                mount_points: vec!["/".into(), "/home".into()],
-                device: "nvme0n1p2".into(),
-                fs_type: "btrfs".into(),
-                total: 1863 * GB,
-                used: 1214 * GB,
-                segments: vec![
-                    DiskSegment { path: "/home/user/.local/share/Steam".into(), size: 486 * GB, kind: SegmentKind::Dir },
-                    DiskSegment { path: "/home/user/Videos".into(), size: 241 * GB, kind: SegmentKind::Dir },
-                    DiskSegment { path: "/home/user".into(), size: 168 * GB, kind: SegmentKind::Rest },
-                    DiskSegment { path: "/home/user/.cache".into(), size: 129 * GB, kind: SegmentKind::Dir },
-                    DiskSegment { path: "/usr".into(), size: 122 * GB, kind: SegmentKind::Dir },
-                    DiskSegment { path: "".into(), size: 46 * GB, kind: SegmentKind::Other },
-                    DiskSegment { path: "".into(), size: 22 * GB, kind: SegmentKind::Hidden },
-                ],
-                scanning: None,
-                scanned_ago: Some(240),
-            },
-            DiskStats {
-                id: "/dev/sda1".into(),
-                mount_points: vec!["/mnt/archive".into()],
-                device: "sda1".into(),
-                fs_type: "ext4".into(),
-                total: 3726 * GB,
-                used: 1102 * GB,
-                segments: vec![],
-                scanning: Some(388 * GB),
-                scanned_ago: None,
-            },
-        ],
+        disks: disks(),
         net: NetStats {
             iface: "wlan0".into(),
             kind: LinkKind::Wireless,
@@ -181,4 +154,83 @@ pub fn snapshot() -> Snapshot {
             group("cg:/system/sddm", "sddm", AppKind::System, vec![proc(901, "sddm", 0, 0.0, 9)], 0.0),
         ],
     }
+}
+
+fn disks() -> Vec<DiskStats> {
+    const GB: u64 = 1 << 30;
+    let scan = std::env::var("SENTINELLE_DEMO").is_ok_and(|v| v == "scan");
+    let seg = |p: &str, gb: u64, kind| DiskSegment { path: p.into(), size: gb * GB, kind };
+    let root = DiskStats {
+        id: "/dev/nvme0n1p2".into(),
+        mount_points: vec!["/".into(), "/home".into()],
+        device: "nvme0n1p2".into(),
+        fs_type: "btrfs".into(),
+        total: 1863 * GB,
+        used: 1214 * GB,
+        segments: vec![
+            seg("/home/user/.local/share/Steam", 486, SegmentKind::Dir),
+            seg("/home/user/Videos", 241, SegmentKind::Dir),
+            seg("/home/user", 168, SegmentKind::Rest),
+            seg("/home/user/.cache", 129, SegmentKind::Dir),
+            seg("/usr", 122, SegmentKind::Dir),
+            seg("", 46, SegmentKind::Other),
+            seg("", 22, SegmentKind::Hidden),
+        ],
+        scanning: None,
+        scanned_ago: Some(if scan { 240 } else { 0 }),
+        source: if scan { DiskSource::Scan } else { DiskSource::Live },
+    };
+    let archive = DiskStats {
+        id: "/dev/sda1".into(),
+        mount_points: vec!["/mnt/archive".into()],
+        device: "sda1".into(),
+        fs_type: "ext4".into(),
+        total: 3726 * GB,
+        used: 1102 * GB,
+        segments: if scan {
+            vec![]
+        } else {
+            vec![
+                seg("/mnt/archive/photos", 512, SegmentKind::Dir),
+                seg("/mnt/archive/backups", 380, SegmentKind::Dir),
+                seg("/mnt/archive", 170, SegmentKind::Rest),
+                seg("", 40, SegmentKind::Other),
+            ]
+        },
+        scanning: scan.then_some(388 * GB),
+        scanned_ago: (!scan).then_some(0),
+        source: if scan { DiskSource::Scan } else { DiskSource::Reconciling { progress: 0.63 } },
+    };
+    let mut disks = vec![root, archive];
+    if !scan {
+        disks.push(DiskStats {
+            id: "/dev/sdb1".into(),
+            mount_points: vec!["/mnt/games".into()],
+            device: "sdb1".into(),
+            fs_type: "ext4".into(),
+            total: 931 * GB,
+            used: 702 * GB,
+            segments: vec![
+                seg("/mnt/games/SteamLibrary/steamapps/common", 611, SegmentKind::Dir),
+                seg("/mnt/games/SteamLibrary/steamapps/shadercache", 71, SegmentKind::Dir),
+                seg("", 20, SegmentKind::Other),
+            ],
+            scanning: None,
+            scanned_ago: Some(0),
+            source: DiskSource::Stale { progress: 0.18 },
+        });
+        disks.push(DiskStats {
+            id: "/dev/sdc1".into(),
+            mount_points: vec!["/mnt/new".into()],
+            device: "sdc1".into(),
+            fs_type: "xfs".into(),
+            total: 1863 * GB,
+            used: 240 * GB,
+            segments: vec![],
+            scanning: Some(91 * GB),
+            scanned_ago: None,
+            source: DiskSource::Indexing { progress: 0.38 },
+        });
+    }
+    disks
 }
