@@ -5,6 +5,7 @@ use super::theme::*;
 use super::widgets::*;
 use crate::core::{AppGroup, AppKind, Command, ProcInfo, Signal};
 use eframe::egui::{self, pos2, vec2, Align2, Color32, CornerRadius, CursorIcon, Rect, Sense, Stroke, Ui};
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
@@ -29,9 +30,11 @@ pub struct AppsState {
     expanded: HashSet<String>,
     closed_sections: HashSet<u8>,
     filter: String,
-    sort: Col,
+    /// Column and whether it's reversed from its natural direction (largest
+    /// first, or A to Z for names). None leaves rows where they are.
+    sort: Option<(Col, bool)>,
     /// Order shown last frame; reused while the pointer is over the list so
-    /// rows don't jump away from the cursor.
+    /// rows don't jump away from the cursor, and kept as is when unsorted.
     order: HashMap<String, usize>,
     confirm: Option<(String, Instant)>,
 }
@@ -42,7 +45,7 @@ impl Default for AppsState {
             expanded: HashSet::new(),
             closed_sections: [section_id(AppKind::Background), section_id(AppKind::System)].into(),
             filter: String::new(),
-            sort: Col::Cpu,
+            sort: Some((Col::Cpu, false)),
             order: HashMap::new(),
             confirm: None,
         }
@@ -101,8 +104,10 @@ pub fn show(ui: &mut Ui, apps: &[AppGroup], total_mem: u64, height: f32, state: 
     let width = ui.available_width();
     card(ui, width, |ui| {
         ui.set_height(height.max(200.0));
-        header(ui, state);
-        let rows = build_rows(apps, state, ui.ui_contains_pointer());
+        // A header click has to show at once, though the pointer is still
+        // over the list.
+        let resorted = header(ui, state);
+        let rows = build_rows(apps, state, ui.ui_contains_pointer() && !resorted);
         let now = Instant::now();
         if state.confirm.as_ref().is_some_and(|(_, t)| now.duration_since(*t) > CONFIRM_FOR) {
             state.confirm = None;
@@ -123,7 +128,8 @@ pub fn show(ui: &mut Ui, apps: &[AppGroup], total_mem: u64, height: f32, state: 
     });
 }
 
-fn header(ui: &mut Ui, state: &mut AppsState) {
+fn header(ui: &mut Ui, state: &mut AppsState) -> bool {
+    let mut clicked = false;
     let w = ui.available_width();
     let (rect, _) = ui.allocate_exact_size(vec2(w, 24.0), Sense::hover());
     let c = columns(rect);
@@ -136,24 +142,36 @@ fn header(ui: &mut Ui, state: &mut AppsState) {
     for (col, r, label, align) in cells {
         let resp = ui.interact(r, ui.id().with(label), Sense::click()).on_hover_cursor(CursorIcon::PointingHand);
         if resp.clicked() {
-            state.sort = col;
+            clicked = true;
+            // Natural direction, then reversed, then unsorted.
+            state.sort = match state.sort {
+                Some((c, false)) if c == col => Some((col, true)),
+                Some((c, true)) if c == col => None,
+                _ => Some((col, false)),
+            };
         }
-        let active = state.sort == col;
+        let reversed = match state.sort {
+            Some((c, r)) if c == col => Some(r),
+            _ => None,
+        };
+        let active = reversed.is_some();
         let color = if active || resp.hovered() { TEXT } else { MUTED };
         let x = if align == Align2::LEFT_CENTER { r.left() + 10.0 } else { r.right() - 8.0 };
         let tr = ui.painter().text(pos2(x, r.center().y), align, label, strong(11.5), color);
         if active {
-            // Sort indicator: a small downward caret.
+            // Sort indicator: a small caret, down for the natural direction
+            // and up once reversed.
             let c = if align == Align2::LEFT_CENTER {
                 pos2(tr.right() + 8.0, r.center().y)
             } else {
                 pos2(tr.left() - 8.0, r.center().y)
             };
-            chevron(ui.painter(), c, true, TEXT);
+            caret(ui.painter(), c, reversed == Some(true), TEXT);
         }
     }
     ui.painter().hline(rect.x_range(), rect.bottom() + 0.5, Stroke::new(1.0, BORDER));
     ui.add_space(4.0);
+    clicked
 }
 
 fn matches(g: &AppGroup, f: &str) -> (bool, bool) {
@@ -175,19 +193,47 @@ fn build_rows<'a>(apps: &'a [AppGroup], state: &mut AppsState, freeze: bool) -> 
         })
         .collect();
 
-    let key = |g: &AppGroup| -> (f64, String) {
-        match state_sort(state) {
-            Col::Name => (0.0, g.name.to_lowercase()),
-            Col::Cpu => (-(g.cpu as f64), g.name.to_lowercase()),
-            Col::Memory => (-(g.mem as f64), g.name.to_lowercase()),
-            Col::Disk => (-g.io, g.name.to_lowercase()),
+    match state.sort {
+        Some((col, reversed)) if !(freeze && !state.order.is_empty()) => {
+            let key = |g: &AppGroup| -> f64 {
+                match col {
+                    Col::Name => 0.0,
+                    Col::Cpu => -(g.cpu as f64),
+                    Col::Memory => -(g.mem as f64),
+                    Col::Disk => -g.io,
+                }
+            };
+            groups.sort_by(|(a, _), (b, _)| {
+                let by_value = key(a).partial_cmp(&key(b)).unwrap_or(Ordering::Equal);
+                let by_name = a.name.to_lowercase().cmp(&b.name.to_lowercase());
+                // Equal values stay A to Z, unless names are the sort itself.
+                match (reversed, col) {
+                    (false, _) => by_value.then(by_name),
+                    (true, Col::Name) => by_name.reverse(),
+                    (true, _) => by_value.reverse().then(by_name),
+                }
+            });
+            state.order = groups.iter().enumerate().map(|(i, (g, _))| (g.key.clone(), i)).collect();
         }
-    };
-    if freeze && !state.order.is_empty() {
-        groups.sort_by_key(|(g, _)| state.order.get(&g.key).copied().unwrap_or(usize::MAX));
-    } else {
-        groups.sort_by(|(a, _), (b, _)| key(a).partial_cmp(&key(b)).unwrap_or(std::cmp::Ordering::Equal));
-        state.order = groups.iter().enumerate().map(|(i, (g, _))| (g.key.clone(), i)).collect();
+        sort => {
+            // Keep last frame's order; anything new goes at the end, A to Z
+            // (the core hands groups over in no particular order).
+            let by_last = |g: &AppGroup| state.order.get(&g.key).copied().unwrap_or(usize::MAX);
+            groups.sort_by(|(a, _), (b, _)| by_last(a).cmp(&by_last(b)).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+            if sort.is_none() {
+                // Remember where new groups landed, and forget ones that are
+                // gone. Keys hidden by the filter keep their place.
+                let live: HashSet<&str> = apps.iter().map(|g| g.key.as_str()).collect();
+                state.order.retain(|k, _| live.contains(k.as_str()));
+                let mut next = state.order.values().max().map_or(0, |m| m + 1);
+                for (g, _) in &groups {
+                    state.order.entry(g.key.clone()).or_insert_with(|| {
+                        next += 1;
+                        next - 1
+                    });
+                }
+            }
+        }
     }
 
     let mut rows = Vec::new();
@@ -211,10 +257,6 @@ fn build_rows<'a>(apps: &'a [AppGroup], state: &mut AppsState, freeze: bool) -> 
     rows
 }
 
-fn state_sort(s: &AppsState) -> Col {
-    s.sort
-}
-
 fn chevron(p: &egui::Painter, center: egui::Pos2, open: bool, color: Color32) {
     let s = 3.5;
     let pts = if open {
@@ -222,6 +264,13 @@ fn chevron(p: &egui::Painter, center: egui::Pos2, open: bool, color: Color32) {
     } else {
         vec![pos2(center.x - s / 2.0, center.y - s), pos2(center.x + s / 2.0, center.y), pos2(center.x - s / 2.0, center.y + s)]
     };
+    p.add(egui::Shape::line(pts, Stroke::new(1.5, color)));
+}
+
+fn caret(p: &egui::Painter, center: egui::Pos2, up: bool, color: Color32) {
+    let s = 3.5;
+    let dy = if up { -s / 2.0 } else { s / 2.0 };
+    let pts = vec![pos2(center.x - s, center.y - dy), pos2(center.x, center.y + dy), pos2(center.x + s, center.y - dy)];
     p.add(egui::Shape::line(pts, Stroke::new(1.5, color)));
 }
 
