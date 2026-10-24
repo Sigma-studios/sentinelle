@@ -3,7 +3,7 @@
 use super::theme::*;
 use super::widgets::*;
 use crate::core::{self, Command, DiskSegment, DiskSource, DiskStats, SegmentKind};
-use eframe::egui::{self, pos2, vec2, Align, Color32, CornerRadius, CursorIcon, Layout, Rect, RichText, Sense, Stroke, Ui};
+use eframe::egui::{pos2, vec2, Align, Color32, CornerRadius, CursorIcon, Layout, Rect, RichText, Sense, Stroke, Ui};
 
 #[derive(Default)]
 pub struct StorageState {
@@ -264,14 +264,3 @@ fn legend_chip(ui: &mut Ui, s: &DiskSegment, color: Color32, active: bool, used:
     }
 }
 
-/// Diagonal hatching: the texture for "space we can't attribute".
-fn hatch(p: &egui::Painter, r: Rect, color: Color32) {
-    let p = p.with_clip_rect(r.intersect(p.clip_rect()));
-    p.rect_filled(r, 0, color.gamma_multiply(0.25));
-    let step = 5.0;
-    let mut x = r.left() - r.height();
-    while x < r.right() {
-        p.line_segment([pos2(x, r.bottom()), pos2(x + r.height(), r.top())], Stroke::new(1.0, color));
-        x += step;
-    }
-}

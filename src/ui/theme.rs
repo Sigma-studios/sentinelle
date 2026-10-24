@@ -47,6 +47,8 @@ pub const RAMP: [Color32; 8] = [
     hex(0x1c5cab),
     hex(0x184f95),
 ];
+/// Memory segments: the same idea in the memory hue, largest app first.
+pub const MEM_RAMP: [Color32; 5] = [hex(0x6fd3ab), hex(0x45bf8f), hex(0x199e70), hex(0x15845e), hex(0x116b4c)];
 pub const OTHER: Color32 = hex(0x4a4a46);
 
 // Status (reserved; always paired with a label)

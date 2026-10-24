@@ -151,3 +151,15 @@ pub fn wired_icon(ui: &mut Ui) {
         p.line_segment([pos2(x, body.top() + 3.0), pos2(x, body.top() + 6.0)], Stroke::new(1.2, TEXT));
     }
 }
+
+/// Diagonal hatching: the texture for "space we can't attribute".
+pub fn hatch(p: &egui::Painter, r: Rect, color: Color32) {
+    let p = p.with_clip_rect(r.intersect(p.clip_rect()));
+    p.rect_filled(r, 0, color.gamma_multiply(0.25));
+    let step = 5.0;
+    let mut x = r.left() - r.height();
+    while x < r.right() {
+        p.line_segment([pos2(x, r.bottom()), pos2(x + r.height(), r.top())], Stroke::new(1.0, color));
+        x += step;
+    }
+}
