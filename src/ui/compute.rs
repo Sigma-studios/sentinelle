@@ -12,6 +12,7 @@ const CHART_H: f32 = 96.0;
 const SECOND_H: f32 = 60.0;
 const FOOTER_H: f32 = 30.0;
 const MIN_CARD_W: f32 = 300.0;
+const BOTTOM_PAD: f32 = 8.0;
 
 enum Card<'a> {
     Cpu(&'a CpuStats),
@@ -32,10 +33,15 @@ pub fn show(ui: &mut Ui, snap: &Snapshot) {
             ui.spacing_mut().item_spacing.x = GAP;
             for c in row {
                 ui.allocate_ui_with_layout(vec2(card_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                    card(ui, card_w, |ui| match c {
-                        Card::Cpu(cpu) => cpu_card(ui, cpu, snap.interval),
-                        Card::Gpu(gpu) => gpu_card(ui, gpu, snap.interval),
-                        Card::Memory(mem, apps) => memory_card(ui, mem, apps, snap.interval),
+                    card(ui, card_w, |ui| {
+                        match c {
+                            Card::Cpu(cpu) => cpu_card(ui, cpu, snap.interval),
+                            Card::Gpu(gpu) => gpu_card(ui, gpu, snap.interval),
+                            Card::Memory(mem, apps) => memory_card(ui, mem, apps, snap.interval),
+                        }
+                        // The footers' bars sit at the bottom of their row:
+                        // room under them, as above the title.
+                        ui.add_space(BOTTOM_PAD);
                     });
                 });
             }
@@ -167,25 +173,10 @@ fn memory_card(ui: &mut Ui, mem: &MemStats, apps: &[AppGroup], interval: f32) {
     ];
     hero_row(ui, num, &format!(" {unit}"), &lines);
     load_chart(ui, &mem.usage, MEMORY, interval);
+    // Cache and swap side by side: two small meters, level with the other
+    // cards' temperature.
     fixed(ui, SECOND_H, |ui| {
         ui.add_space(8.0);
-        let segments = memory_segments(mem, apps);
-        ui.horizontal(|ui| {
-            key(ui, MEMORY, "By application");
-            if let Some((MemSeg::App(_, g), size)) = segments.first() {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    ui.label(secondary(bytes(*size as f64)));
-                    ui.add(egui::Label::new(muted(g.name.as_str())).truncate());
-                });
-            }
-        });
-        ui.add_space(4.0);
-        let w = ui.available_width();
-        memory_bar(ui, w, mem, &segments);
-    });
-    // Cache and swap side by side: two small meters.
-    fixed(ui, FOOTER_H, |ui| {
-        ui.add_space(2.0);
         let half = ((ui.available_width() - GAP) / 2.0).floor();
         let cache_frac = if mem.total > 0 { mem.cached as f32 / mem.total as f32 } else { 0.0 };
         // Half a card is too narrow for "used / total": the total is on hover.
@@ -203,7 +194,7 @@ fn memory_card(ui: &mut Ui, mem: &MemStats, apps: &[AppGroup], interval: f32) {
             ("Cache", secondary(bytes(mem.cached as f64)), cache_frac, MEMORY.gamma_multiply(0.55), cache_tip),
             ("Swap", swap_text, swap_frac, MEMORY, swap_tip),
         ];
-        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), FOOTER_H - 2.0), Sense::hover());
+        let (row, _) = ui.allocate_exact_size(vec2(ui.available_width(), 28.0), Sense::hover());
         for (i, (label, text, frac, color, tip)) in halves.into_iter().enumerate() {
             let left = row.left() + i as f32 * (half + GAP);
             let rect = Rect::from_min_size(pos2(left, row.top()), vec2(half, row.height()));
@@ -215,6 +206,23 @@ fn memory_card(ui: &mut Ui, mem: &MemStats, apps: &[AppGroup], interval: f32) {
             meter(&mut ui, half, frac, color);
             ui.interact(rect, ui.id().with(label), Sense::hover()).on_hover_text(tip);
         }
+    });
+    // Where the memory goes, as the footer like the other cards' bars.
+    fixed(ui, FOOTER_H, |ui| {
+        ui.add_space(2.0);
+        let segments = memory_segments(mem, apps);
+        ui.horizontal(|ui| {
+            key(ui, MEMORY, "By application");
+            if let Some((MemSeg::App(_, g), size)) = segments.first() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(secondary(bytes(*size as f64)));
+                    ui.add(egui::Label::new(muted(g.name.as_str())).truncate());
+                });
+            }
+        });
+        ui.add_space(2.0);
+        let w = ui.available_width();
+        memory_bar(ui, vec2(w, 8.0), mem, &segments);
     });
 }
 
@@ -253,10 +261,10 @@ fn memory_segments<'a>(mem: &MemStats, apps: &'a [AppGroup]) -> Vec<(MemSeg<'a>,
 
 /// A stacked bar over all installed memory, like a Storage bar: one segment
 /// per entry, free memory left as track. Hover names a segment.
-fn memory_bar(ui: &mut Ui, width: f32, mem: &MemStats, segments: &[(MemSeg, u64)]) {
-    let (bar, resp) = ui.allocate_exact_size(vec2(width, 16.0), Sense::hover());
+fn memory_bar(ui: &mut Ui, size: egui::Vec2, mem: &MemStats, segments: &[(MemSeg, u64)]) {
+    let (bar, resp) = ui.allocate_exact_size(size, Sense::hover());
     let p = ui.painter();
-    p.rect_filled(bar, CornerRadius::same(4), TRACK);
+    p.rect_filled(bar, CornerRadius::same(3), TRACK);
     let total = mem.total.max(1) as f32;
     let gap = 2.0;
     let mut x = bar.left();
@@ -279,18 +287,18 @@ fn memory_bar(ui: &mut Ui, width: f32, mem: &MemStats, segments: &[(MemSeg, u64)
         if hovered.is_some_and(|h| h != i) {
             c = c.gamma_multiply(0.35);
         }
-        let cr = if i == 0 { CornerRadius { nw: 4, sw: 4, ne: 0, se: 0 } } else { CornerRadius::ZERO };
+        let cr = if i == 0 { CornerRadius { nw: 3, sw: 3, ne: 0, se: 0 } } else { CornerRadius::ZERO };
         if let MemSeg::System = seg {
             hatch(p, *r, c);
             continue;
         }
         p.rect_filled(*r, cr, c);
-        // The name inside the segment when it fits: dark on the bright
-        // shades, light on the deep ones.
+        // The name inside the segment when it fits (a taller bar): dark on
+        // the bright shades, light on the deep ones.
         if let MemSeg::App(rank, g) = seg {
             let ink = if *rank < 2 { BG } else { TEXT };
             let galley = ui.fonts_mut(|f| f.layout_no_wrap(g.name.clone(), font(11.0), ink));
-            if galley.size().x + 10.0 <= r.width() {
+            if galley.size().x + 10.0 <= r.width() && galley.size().y + 2.0 <= r.height() {
                 p.galley(pos2(r.left() + 5.0, r.center().y - galley.size().y / 2.0), galley, ink);
             }
         }
