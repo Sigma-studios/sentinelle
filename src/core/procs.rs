@@ -15,7 +15,7 @@ use super::apps::{self, DesktopNames};
 use super::steam::{self, SteamLibrary};
 use super::util::{clk_tck, current_uid, page_size, read_into};
 use super::{AppGroup, AppKind, ProcInfo};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -53,9 +53,49 @@ struct Raw {
     pid: u32,
     ppid: u32,
     starttime: u64,
+    /// utime + stime.
     ticks: u64,
+    /// cutime + cstime: lifetime CPU of reaped children, grandchildren included.
+    cticks: u64,
     mem: u64,
+    /// read_bytes + write_bytes. Like `cticks`, this grows by a child's
+    /// lifetime I/O when the child is reaped.
     io: Option<u64>,
+}
+
+/// What `read_one` found for a pid. Zombies aren't displayed, but they keep
+/// their last live totals until their parent reaps them (see `rates`).
+enum Read {
+    Live(Raw),
+    Zombie { pid: u32, starttime: u64 },
+    Skip,
+}
+
+/// What the previous sample knew of a process.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Prev {
+    starttime: u64,
+    ppid: u32,
+    ticks: u64,
+    cticks: u64,
+    io: Option<u64>,
+}
+
+impl Prev {
+    fn of(r: &Raw) -> Self {
+        Self { starttime: r.starttime, ppid: r.ppid, ticks: r.ticks, cticks: r.cticks, io: r.io }
+    }
+}
+
+/// Timing of the current sample, for `rates`.
+struct Clock {
+    /// Seconds since the previous sample.
+    dt: f64,
+    /// /proc/uptime now and at the previous sample, in seconds.
+    uptime: f64,
+    prev_uptime: Option<f64>,
+    clk: f64,
+    ncpu: f64,
 }
 
 pub struct ProcSampler {
@@ -65,9 +105,9 @@ pub struct ProcSampler {
     ncpu: f64,
     tick: u64,
     statics: HashMap<u32, Static>,
-    /// pid -> (starttime, cpu ticks, io bytes)
-    prev: HashMap<u32, (u64, u64, Option<u64>)>,
+    prev: HashMap<u32, Prev>,
     prev_time: Instant,
+    prev_uptime: Option<f64>,
     steam: SteamLibrary,
     desktop: DesktopNames,
     names: HashMap<String, String>,
@@ -85,6 +125,7 @@ impl ProcSampler {
             statics: HashMap::new(),
             prev: HashMap::new(),
             prev_time: Instant::now(),
+            prev_uptime: None,
             steam: SteamLibrary::default(),
             desktop: DesktopNames::default(),
             names: HashMap::new(),
@@ -98,47 +139,40 @@ impl ProcSampler {
         let dt = now.duration_since(self.prev_time).as_secs_f64().max(1e-3);
         self.prev_time = now;
 
-        let raws = self.read_all();
+        let uptime = read_uptime(&mut self.buf);
+        let (raws, zombies) = self.read_all();
 
-        // Per-process rates.
-        let mut cpu = Vec::with_capacity(raws.len());
-        let mut io = Vec::with_capacity(raws.len());
-        let mut next_prev = HashMap::with_capacity(raws.len());
-        for r in &raws {
-            let (c, i) = match self.prev.get(&r.pid) {
-                Some(&(st, ticks, pio)) if st == r.starttime => {
-                    let c = r.ticks.saturating_sub(ticks) as f64 / self.clk / dt / self.ncpu * 100.0;
-                    let i = match (r.io, pio) {
-                        (Some(a), Some(b)) => a.saturating_sub(b) as f64 / dt,
-                        _ => 0.0,
-                    };
-                    (c.min(100.0) as f32, i)
-                }
-                _ => (0.0, 0.0),
-            };
-            cpu.push(c);
-            io.push(i);
-            next_prev.insert(r.pid, (r.starttime, r.ticks, r.io));
-        }
+        let clock = Clock { dt, uptime: uptime.unwrap_or(0.0), prev_uptime: self.prev_uptime, clk: self.clk, ncpu: self.ncpu };
+        let (cpu, io, next_prev) = rates(&self.prev, &raws, &zombies, &clock);
         self.prev = next_prev;
+        // Without uptime, new processes can't be told from missed old ones.
+        self.prev_uptime = uptime;
         self.statics.retain(|pid, _| self.prev.contains_key(pid));
 
         self.group(&raws, &cpu, &io)
     }
 
-    fn read_all(&mut self) -> Vec<Raw> {
+    /// Live processes, and zombies as (pid, starttime).
+    fn read_all(&mut self) -> (Vec<Raw>, Vec<(u32, u64)>) {
         let mut out = Vec::with_capacity(512);
-        let Ok(rd) = std::fs::read_dir("/proc") else { return out };
+        let mut zombies = Vec::new();
+        let Ok(rd) = std::fs::read_dir("/proc") else { return (out, zombies) };
         for e in rd.flatten() {
             let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
-            if let Some(r) = self.read_one(pid) {
-                out.push(r);
+            match self.read_one(pid) {
+                Read::Live(r) => out.push(r),
+                Read::Zombie { pid, starttime } => zombies.push((pid, starttime)),
+                Read::Skip => {}
             }
         }
-        out
+        (out, zombies)
     }
 
-    fn read_one(&mut self, pid: u32) -> Option<Raw> {
+    fn read_one(&mut self, pid: u32) -> Read {
+        self.read_one_inner(pid).unwrap_or(Read::Skip)
+    }
+
+    fn read_one_inner(&mut self, pid: u32) -> Option<Read> {
         let dir = PathBuf::from(format!("/proc/{pid}"));
         if !read_into(&dir.join("stat"), &mut self.buf) {
             return None;
@@ -155,11 +189,17 @@ impl ProcSampler {
         let ppid: u32 = f[1].parse().ok()?;
         let flags: u64 = f[6].parse().unwrap_or(0);
         const PF_KTHREAD: u64 = 0x0020_0000;
-        if flags & PF_KTHREAD != 0 || pid == 2 || ppid == 2 || state == "Z" {
+        if flags & PF_KTHREAD != 0 || pid == 2 || ppid == 2 {
             return None;
         }
-        let ticks = f[11].parse::<u64>().unwrap_or(0) + f[12].parse::<u64>().unwrap_or(0);
-        let starttime: u64 = f[19].parse().unwrap_or(0);
+        // `f` starts at stat field 3 (state), so field n is f[n - 3].
+        let num = |i: usize| f[i].parse::<u64>().unwrap_or(0);
+        let starttime = num(19);
+        if state == "Z" {
+            return Some(Read::Zombie { pid, starttime });
+        }
+        let ticks = num(11) + num(12);
+        let cticks = num(13) + num(14);
 
         let mem = if read_into(&dir.join("statm"), &mut self.buf) {
             let s = std::str::from_utf8(&self.buf).unwrap_or("");
@@ -198,7 +238,7 @@ impl ProcSampler {
             None
         };
 
-        Some(Raw { pid, ppid, starttime, ticks, mem, io })
+        Some(Read::Live(Raw { pid, ppid, starttime, ticks, cticks, mem, io }))
     }
 
     fn refresh_static(&mut self, pid: u32, dir: &std::path::Path, starttime: u64, comm: String) {
@@ -394,6 +434,117 @@ impl ProcSampler {
     }
 }
 
+/// Per-process CPU (% of the whole machine) and I/O (bytes/s) since the
+/// previous sample, aligned with `raws`, and the totals to keep for the next one.
+///
+/// A process seen in both samples is charged its own CPU delta plus the part
+/// of its reaped children's CPU (the `cticks` delta) not already charged to
+/// them: when a child is reaped the kernel adds its whole lifetime to the
+/// parent's `cticks`, and the child's totals as of its last sample were
+/// already counted under the child. The same goes for I/O, which the kernel
+/// also folds into the parent at reap time.
+///
+/// A process that started since the previous sample is charged everything it
+/// has used, over its age (or `dt`, if shorter).
+fn rates(
+    prev: &HashMap<u32, Prev>,
+    raws: &[Raw],
+    zombies: &[(u32, u64)],
+    t: &Clock,
+) -> (Vec<f32>, Vec<f64>, HashMap<u32, Prev>) {
+    let index: HashMap<u32, usize> = raws.iter().enumerate().map(|(i, r)| (r.pid, i)).collect();
+    // Same process as in the previous sample (pids get reused).
+    let continuing = |pid: u32| -> Option<usize> {
+        let &i = index.get(&pid)?;
+        (prev.get(&pid)?.starttime == raws[i].starttime).then_some(i)
+    };
+
+    let mut next: HashMap<u32, Prev> = raws.iter().map(|r| (r.pid, Prev::of(r))).collect();
+    // Zombies keep their last live totals until reaped; never seen alive,
+    // there is nothing of theirs to subtract later.
+    let mut carried = HashSet::new();
+    for &(pid, st) in zombies {
+        if let Some(p) = prev.get(&pid).filter(|p| p.starttime == st) {
+            next.insert(pid, *p);
+            carried.insert(pid);
+        }
+    }
+
+    // Processes gone since the previous sample. Their last totals were
+    // already counted; take them off the cticks/io jump of whoever reaped
+    // them: the nearest ancestor that is still around. If that is a zombie,
+    // fold them into it so they come off when it is reaped in turn.
+    let gone = |pid: u32| !carried.contains(&pid) && continuing(pid).is_none();
+    let mut sub_ticks = vec![0u64; raws.len()];
+    let mut sub_io = vec![0u64; raws.len()];
+    for (&pid, p) in prev {
+        if !gone(pid) {
+            continue;
+        }
+        let (ticks, io) = (p.ticks + p.cticks, p.io.unwrap_or(0));
+        let mut anc = p.ppid;
+        for _ in 0..256 {
+            if let Some(i) = continuing(anc) {
+                sub_ticks[i] += ticks;
+                sub_io[i] += io;
+                break;
+            }
+            if carried.contains(&anc) {
+                let z = next.get_mut(&anc).unwrap();
+                z.cticks += ticks;
+                z.io = z.io.map(|v| v + io);
+                break;
+            }
+            match prev.get(&anc) {
+                Some(a) if gone(anc) => anc = a.ppid,
+                _ => break,
+            }
+        }
+    }
+
+    let tick = 1.0 / t.clk;
+    let mut cpu = Vec::with_capacity(raws.len());
+    let mut io = Vec::with_capacity(raws.len());
+    for (i, r) in raws.iter().enumerate() {
+        let (ticks, cticks, bytes, secs) = match prev.get(&r.pid).filter(|p| p.starttime == r.starttime) {
+            Some(p) => (
+                r.ticks.saturating_sub(p.ticks),
+                r.cticks.saturating_sub(p.cticks),
+                match (r.io, p.io) {
+                    (Some(a), Some(b)) => a.saturating_sub(b),
+                    _ => 0,
+                },
+                t.dt,
+            ),
+            None => {
+                let start = r.starttime as f64 * tick;
+                // Started after the previous sample (give or take a tick);
+                // otherwise it was missed, and its totals predate the interval.
+                let new = t.prev_uptime.is_some_and(|pu| start + tick >= pu);
+                if !new {
+                    cpu.push(0.0);
+                    io.push(0.0);
+                    continue;
+                }
+                let age = (t.uptime - start).max(tick);
+                (r.ticks, r.cticks, r.io.unwrap_or(0), t.dt.min(age))
+            }
+        };
+        let used = ticks + cticks.saturating_sub(sub_ticks[i]);
+        let c = used as f64 * tick / secs / t.ncpu * 100.0;
+        cpu.push(c.min(100.0) as f32);
+        io.push(bytes.saturating_sub(sub_io[i]) as f64 / secs);
+    }
+    (cpu, io, next)
+}
+
+fn read_uptime(buf: &mut Vec<u8>) -> Option<f64> {
+    if !read_into(std::path::Path::new("/proc/uptime"), buf) {
+        return None;
+    }
+    std::str::from_utf8(buf).ok()?.split_ascii_whitespace().next()?.parse().ok()
+}
+
 fn parse_cgroup(buf: &[u8]) -> String {
     let s = String::from_utf8_lossy(buf);
     // cgroup v2 unified line is "0::/path"; fall back to the last line.
@@ -425,6 +576,118 @@ mod tests {
         assert_eq!(display_name("steamwebhelper", "/home/u/.steam/ubuntu12_64/steamwebhelper"), "steamwebhelper");
         assert_eq!(display_name("EldenRing.exe", "Z:\\games\\ELDEN RING\\Game\\EldenRing.exe"), "EldenRing.exe");
         assert_eq!(display_name("xdg-desktop-por", "/usr/libexec/xdg-desktop-portal-kde"), "xdg-desktop-portal-kde");
+    }
+
+    fn raw(pid: u32, ppid: u32, starttime: u64, ticks: u64, cticks: u64, io: u64) -> Raw {
+        Raw { pid, ppid, starttime, ticks, cticks, mem: 0, io: Some(io) }
+    }
+
+    fn prev_of(raws: &[Raw]) -> HashMap<u32, Prev> {
+        raws.iter().map(|r| (r.pid, Prev::of(r))).collect()
+    }
+
+    /// clk 100 Hz, one CPU, one second between samples: 1 tick = 1%.
+    fn clock(uptime: f64) -> Clock {
+        Clock { dt: 1.0, uptime, prev_uptime: Some(uptime - 1.0), clk: 100.0, ncpu: 1.0 }
+    }
+
+    fn close(a: f64, b: f64) -> bool {
+        (a - b).abs() < 1e-3
+    }
+
+    #[test]
+    fn exited_child_counted_once() {
+        // The child had used 50 ticks (already charged to it) and 1000 bytes
+        // of I/O; it ran 30 more ticks and did 500 more bytes before exiting.
+        let before = [raw(10, 1, 100, 100, 0, 0), raw(11, 10, 200, 50, 0, 1000)];
+        let after = [raw(10, 1, 100, 110, 80, 1500 + 200)];
+        let (cpu, io, next) = rates(&prev_of(&before), &after, &[], &clock(500.0));
+        assert!(close(cpu[0] as f64, 10.0 + 30.0), "{cpu:?}");
+        assert!(close(io[0], 200.0 + 500.0), "{io:?}");
+        assert!(!next.contains_key(&11));
+    }
+
+    #[test]
+    fn new_process_charged_over_its_age() {
+        let prev = prev_of(&[raw(1, 0, 1, 0, 0, 0)]);
+        // Started 0.5 s ago, at uptime 100.5, with 30 ticks: 0.3 s / 0.5 s.
+        let r = [raw(1, 0, 1, 0, 0, 0), raw(42, 1, 10050, 30, 0, 0)];
+        let (cpu, _, _) = rates(&prev, &r, &[], &clock(101.0));
+        assert!(close(cpu[1] as f64, 30.0 / 100.0 / 0.5 * 100.0), "{cpu:?}");
+
+        // dt shorter than the age (the two clocks drift): divide by dt.
+        let t = Clock { dt: 0.4, uptime: 101.0, prev_uptime: Some(100.5), clk: 100.0, ncpu: 1.0 };
+        let (cpu, _, _) = rates(&prev, &r, &[], &t);
+        assert!(close(cpu[1] as f64, 30.0 / 100.0 / 0.4 * 100.0), "{cpu:?}");
+
+        // Its own children reaped before we saw it count too.
+        let r = [raw(42, 1, 10050, 10, 20, 0)];
+        let (cpu, _, _) = rates(&prev, &r, &[], &clock(101.0));
+        assert!(close(cpu[0] as f64, 60.0), "{cpu:?}");
+    }
+
+    #[test]
+    fn unseen_old_process_not_charged() {
+        // Started long before the previous sample but missing from it (the
+        // first sample, or a failed read): its totals aren't from this interval.
+        let r = [raw(42, 1, 100, 5000, 0, 0)];
+        let (cpu, _, _) = rates(&HashMap::new(), &r, &[], &clock(101.0));
+        assert_eq!(cpu, [0.0]);
+        let first = Clock { prev_uptime: None, ..clock(101.0) };
+        let (cpu, _, _) = rates(&HashMap::new(), &r, &[], &first);
+        assert_eq!(cpu, [0.0]);
+    }
+
+    #[test]
+    fn short_lived_child_charged_to_parent() {
+        // A child born and reaped between two samples: 25 ticks, never seen.
+        let before = [raw(10, 1, 100, 100, 0, 0)];
+        let after = [raw(10, 1, 100, 100, 25, 0)];
+        let (cpu, _, _) = rates(&prev_of(&before), &after, &[], &clock(500.0));
+        assert!(close(cpu[0] as f64, 25.0), "{cpu:?}");
+    }
+
+    #[test]
+    fn zombie_charged_when_reaped() {
+        let p0 = prev_of(&[raw(10, 1, 100, 100, 0, 0), raw(11, 10, 200, 50, 0, 0)]);
+        // The child exits and stays a zombie for a sample: nothing moves yet.
+        let (cpu, _, p1) = rates(&p0, &[raw(10, 1, 100, 100, 0, 0)], &[(11, 200)], &clock(500.0));
+        assert_eq!(cpu, [0.0]);
+        assert_eq!(p1[&11], p0[&11]);
+        // Reaped: its whole 70 ticks land in cticks, 50 were already counted.
+        let (cpu, _, p2) = rates(&p1, &[raw(10, 1, 100, 100, 70, 0)], &[], &clock(501.0));
+        assert!(close(cpu[0] as f64, 20.0), "{cpu:?}");
+        assert!(!p2.contains_key(&11));
+    }
+
+    #[test]
+    fn grandchild_reaped_through_exited_child() {
+        // 10 -> 11 -> 12. 12 exits (reaped by 11, 25 ticks in total), then
+        // 11 exits (reaped by 10, 15 ticks of its own) in the same interval.
+        let before = [raw(10, 1, 100, 0, 0, 0), raw(11, 10, 200, 10, 0, 0), raw(12, 11, 300, 20, 0, 0)];
+        let after = [raw(10, 1, 100, 0, 15 + 25, 0)];
+        let (cpu, _, _) = rates(&prev_of(&before), &after, &[], &clock(500.0));
+        // Already counted: 10 + 20. Left: 5 + 5.
+        assert!(close(cpu[0] as f64, 10.0), "{cpu:?}");
+    }
+
+    #[test]
+    fn reused_pid_is_a_new_process() {
+        let before = [raw(10, 1, 100, 0, 0, 0), raw(11, 10, 200, 500, 0, 0)];
+        // 11 exited and was reaped (5 ticks after its last sample); a new
+        // process got pid 11 at uptime 499.5 and used 10 ticks.
+        let after = [raw(10, 1, 100, 0, 505, 0), raw(11, 10, 49950, 10, 0, 0)];
+        let (cpu, _, _) = rates(&prev_of(&before), &after, &[], &clock(500.0));
+        assert!(close(cpu[0] as f64, 5.0), "{cpu:?}");
+        assert!(close(cpu[1] as f64, 20.0), "{cpu:?}");
+    }
+
+    #[test]
+    fn capped_at_whole_machine() {
+        let before = [raw(10, 1, 100, 0, 0, 0)];
+        let after = [raw(10, 1, 100, 0, 5000, 0)];
+        let (cpu, _, _) = rates(&prev_of(&before), &after, &[], &clock(500.0));
+        assert_eq!(cpu, [100.0]);
     }
 
     #[test]
